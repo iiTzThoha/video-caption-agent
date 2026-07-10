@@ -1,15 +1,22 @@
 # Video Caption Agent
 
-An AI agent that watches a video clip and generates captions in four type of styles: **formal**, **sarcastic**, **humorous_tech**, and **humorous_non_tech**.
+An AI agent that watches a video clip and generates captions in four styles: **formal**, **sarcastic**, **humorous_tech**, and **humorous_non_tech**.
 
 Built for the AMD Developer Hackathon: Act II Track 2 (Video Captioning Agent).
 
 ## How it works
 
-The pipeline uses a two stage approach via the [Fireworks AI](https://fireworks.ai) API:
+The pipeline uses a two-stage approach via the [Fireworks AI](https://fireworks.ai) API:
 
-1. **Video understanding** : `minimax-m3` watches the video directly (native video input) and produces a detailed description of the setting, subjects, actions, and mood.
-2. **Style generation** : the description is rewritten into each requested caption style in a single call, with a strict key validation and automatic retry if the model returns malformed output.
+1. **Video understanding**: minimax-m3 watches the video directly (native video input) and produces a detailed factual description of the setting, subjects, actions, and mood.
+
+2. **Style generation**: The description is rewritten into each requested caption style in a single API call, with intelligent key normalization to handle variations in model output.
+
+## Optimizations
+
+- **Single-pass generation**: Each video requires only 2 API calls (1 for description, 1 for styled captions)
+- **Key normalization**: Automatically handles common misspellings (e.g., "sarcasm" → "sarcastic") without retries
+- **Graceful failure**: If a task fails, empty captions are written and processing continues
 
 ## Docker image
 
@@ -61,9 +68,16 @@ docker run --rm \
 
 ## Requirements
 
-- `FIREWORKS_API_KEY` must be set as an environment variable at runtime (not baked into the image).
+- FIREWORKS_API_KEY must be set as an environment variable at runtime (not baked into the image).
 - No local GPU or model weights required. All inference happens via the Fireworks AI API.
+- Video clips should be publicly accessible URLs (direct MP4 links).
 
 ## Error handling
 
-If a task fails (e.g. an unreachable video URL), the pipeline logs the error, writes empty captions for that task, and continues processing the remaining tasks rather than crashing the whole run.
+If a task fails (e.g., unreachable video URL, API error), the pipeline logs the error, writes empty captions for that task, and continues processing the remaining tasks rather than crashing the whole run.
+
+## Example clips (for development)
+
+- Urban: https://storage.googleapis.com/amd-hackathon-clips/1868079-uhd_2560_1440_25fps.mp4
+- Kitten: https://storage.googleapis.com/amd-hackathon-clips/13825391-uhd_3840_2160_30fps.mp4
+- Office: https://storage.googleapis.com/amd-hackathon-clips/3044693-uhd_3840_2160_24fps.mp4
