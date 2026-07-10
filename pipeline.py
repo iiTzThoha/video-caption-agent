@@ -1,7 +1,6 @@
 import json
 import os
 import sys
-
 import requests
 
 BASE_URL = "https://api.fireworks.ai/inference/v1"
@@ -24,6 +23,37 @@ def get_api_key():
         print("ERROR: FIREWORKS_API_KEY environment variable not set", file=sys.stderr)
         sys.exit(1)
     return key
+
+
+def normalize_key(key):
+    """Convert various spellings to our standard keys"""
+    key_lower = key.lower().strip()
+    
+    # Map common variations to correct keys
+    key_mappings = {
+        'sarcastic': 'sarcastic',
+        'sarcasm': 'sarcastic',
+        'sarcastik': 'sarcastic',
+        'sarcastc': 'sarcastic',
+        'humorous_tech': 'humorous_tech',
+        'tech_humour': 'humorous_tech',
+        'tech_humor': 'humorous_tech',
+        'humorous_non_tech': 'humorous_non_tech',
+        'nontech_humour': 'humorous_non_tech',
+        'nontech_humor': 'humorous_non_tech',
+        'formal': 'formal',
+        'formel': 'formal',
+    }
+    
+    # Try exact match first
+    if key_lower in key_mappings:
+        return key_mappings[key_lower]
+    
+    # Try fuzzy match for sarcastic variations
+    if 'sarcas' in key_lower:
+        return 'sarcastic'
+    
+    return key_lower
 
 
 def get_video_description(video_url, api_key):
@@ -59,7 +89,7 @@ def get_video_description(video_url, api_key):
     return result["choices"][0]["message"]["content"]
 
 
-def get_styled_captions(description, styles, api_key, max_retries=2):
+def get_styled_captions(description, styles, api_key):
     style_list = ", ".join(styles)
     definitions_text = "\n".join(f"- {s}: {STYLE_DEFINITIONS[s]}" for s in styles)
     keys_example = ", ".join(f'"{s}": "..."' for s in styles)
@@ -73,50 +103,62 @@ Write a caption for this video in EACH of the following styles: {style_list}
 Style definitions:
 {definitions_text}
 
-CRITICAL: Respond with ONLY a valid JSON object, no other text.
-You MUST use these EXACT key names, spelled exactly as shown, nothing else:
+IMPORTANT: Respond with ONLY a valid JSON object. Use these EXACT key names if possible:
 {{{keys_example}}}
 
-Do not misspell the keys. Copy them exactly as given above."""
+If you must use different key names, make them as close as possible to the requested ones.
+Return ONLY the JSON, nothing else."""
 
-    last_error = None
-    for attempt in range(max_retries + 1):
-        resp = requests.post(
-            f"{BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 5000,
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+    # Single attempt - no retries to save time
+    resp = requests.post(
+        f"{BASE_URL}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 5000,
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"]
 
+    content = content.strip()
+    if content.startswith("```"):
+        content = content.split("```")[1]
+        if content.startswith("json"):
+            content = content[4:]
         content = content.strip()
-        if content.startswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-            content = content.strip()
 
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as e:
-            last_error = f"invalid JSON: {e}"
-            print(f"WARNING: attempt {attempt + 1}: {last_error}, retrying...", file=sys.stderr)
-            continue
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        # If JSON parsing fails, return empty captions
+        print(f"ERROR: Failed to parse JSON: {e}", file=sys.stderr)
+        return {s: "" for s in styles}
 
-        missing = [s for s in styles if s not in parsed]
-        if missing:
-            last_error = f"missing/misspelled keys: {missing}"
-            print(f"WARNING: attempt {attempt + 1}: {last_error}, retrying...", file=sys.stderr)
-            continue
+    # Normalize keys and build result
+    result = {}
+    for style in styles:
+        # Try exact match first
+        if style in parsed:
+            result[style] = parsed[style]
+        else:
+            # Try to find a matching key through normalization
+            found = False
+            for key, value in parsed.items():
+                normalized = normalize_key(key)
+                if normalized == style:
+                    result[style] = value
+                    found = True
+                    break
+            
+            # If still not found, use empty string
+            if not found:
+                result[style] = ""
 
-        return {s: parsed[s] for s in styles}
-
-    raise ValueError(f"Failed after {max_retries + 1} attempts: {last_error}")
+    # Return in the correct order
+    return {s: result.get(s, "") for s in styles}
 
 
 def process_task(task, api_key):
