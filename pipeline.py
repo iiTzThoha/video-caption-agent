@@ -28,8 +28,7 @@ def get_api_key():
 def normalize_key(key):
     """Convert various spellings to our standard keys"""
     key_lower = key.lower().strip()
-    
-    # Map common variations to correct keys
+
     key_mappings = {
         'sarcastic': 'sarcastic',
         'sarcasm': 'sarcastic',
@@ -44,15 +43,13 @@ def normalize_key(key):
         'formal': 'formal',
         'formel': 'formal',
     }
-    
-    # Try exact match first
+
     if key_lower in key_mappings:
         return key_mappings[key_lower]
-    
-    # Try fuzzy match for sarcastic variations
+
     if 'sarcas' in key_lower:
         return 'sarcastic'
-    
+
     return key_lower
 
 
@@ -79,7 +76,7 @@ def get_video_description(video_url, api_key):
             ],
             "max_tokens": 5000,
         },
-        timeout=120,
+        timeout=25,
     )
     resp.raise_for_status()
     result = resp.json()
@@ -89,7 +86,28 @@ def get_video_description(video_url, api_key):
     return result["choices"][0]["message"]["content"]
 
 
-def get_styled_captions(description, styles, api_key):
+def _map_parsed_to_styles(parsed, styles):
+    """Match parsed JSON keys to requested styles, using normalization as a fallback."""
+    result = {}
+    for style in styles:
+        if style in parsed:
+            result[style] = parsed[style]
+            continue
+        found = False
+        for key, value in parsed.items():
+            if normalize_key(key) == style:
+                result[style] = value
+                found = True
+                break
+        if not found:
+            result[style] = ""
+    return result
+
+
+def get_styled_captions(description, styles, api_key, max_retries=1):
+    """Generate styled captions. Tries up to (max_retries + 1) times total,
+    only retrying if keys are missing after normalization. Bounded so a bad
+    response can't spiral into a long stall."""
     style_list = ", ".join(styles)
     definitions_text = "\n".join(f"- {s}: {STYLE_DEFINITIONS[s]}" for s in styles)
     keys_example = ", ".join(f'"{s}": "..."' for s in styles)
@@ -103,62 +121,51 @@ Write a caption for this video in EACH of the following styles: {style_list}
 Style definitions:
 {definitions_text}
 
-IMPORTANT: Respond with ONLY a valid JSON object. Use these EXACT key names if possible:
+CRITICAL: Respond with ONLY a valid JSON object, no other text.
+You MUST use these EXACT key names, spelled exactly as shown, nothing else:
 {{{keys_example}}}
 
-If you must use different key names, make them as close as possible to the requested ones.
-Return ONLY the JSON, nothing else."""
+Do not misspell the keys. Copy them exactly as given above."""
 
-    # Single attempt - no retries to save time
-    resp = requests.post(
-        f"{BASE_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 5000,
-        },
-        timeout=120,
-    )
-    resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"]
+    result = {s: "" for s in styles}
 
-    content = content.strip()
-    if content.startswith("```"):
-        content = content.split("```")[1]
-        if content.startswith("json"):
-            content = content[4:]
-        content = content.strip()
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 5000,
+                },
+                timeout=25,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
 
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as e:
-        # If JSON parsing fails, return empty captions
-        print(f"ERROR: Failed to parse JSON: {e}", file=sys.stderr)
-        return {s: "" for s in styles}
+            content = content.strip()
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
 
-    # Normalize keys and build result
-    result = {}
-    for style in styles:
-        # Try exact match first
-        if style in parsed:
-            result[style] = parsed[style]
-        else:
-            # Try to find a matching key through normalization
-            found = False
-            for key, value in parsed.items():
-                normalized = normalize_key(key)
-                if normalized == style:
-                    result[style] = value
-                    found = True
-                    break
-            
-            # If still not found, use empty string
-            if not found:
-                result[style] = ""
+            parsed = json.loads(content)
+        except (requests.RequestException, json.JSONDecodeError, KeyError, IndexError) as e:
+            print(f"WARNING: attempt {attempt + 1} failed: {e}", file=sys.stderr)
+            continue
 
-    # Return in the correct order
-    return {s: result.get(s, "") for s in styles}
+        result = _map_parsed_to_styles(parsed, styles)
+        missing = [s for s in styles if not result[s]]
+        if not missing:
+            return result  # all styles present, done
+
+        print(f"WARNING: attempt {attempt + 1}: missing styles {missing}", file=sys.stderr)
+        # loop again only if we have retries left; otherwise fall through and
+        # return whatever we have (partial credit beats a crashed task)
+
+    return result
 
 
 def process_task(task, api_key):
@@ -194,7 +201,6 @@ def main():
         except Exception as e:
             print(f"ERROR processing task {task.get('task_id', '?')}: {e}", file=sys.stderr)
             had_failure = True
-            # still write a placeholder so results.json stays valid JSON
             results.append({
                 "task_id": task.get("task_id", "unknown"),
                 "captions": {s: "" for s in task.get("styles", [])},
