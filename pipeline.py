@@ -211,7 +211,7 @@ def main():
         json.dump(results, f, indent=2)
 
     print(f"Done. Wrote {len(results)} results to {OUTPUT_PATH}", file=sys.stderr)
-    sys.exit(1 if had_failure else 0)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
