@@ -54,12 +54,7 @@ def normalize_key(key):
 
 
 def get_video_description(video_url, api_key):
-    """
-    Sharpened prompt: pushes for concrete, checkable detail (colors, counts,
-    visible text/logos, sequence of actions) rather than a generic vibe, since
-    the accuracy judge scores how faithfully captions reflect actual content.
-    Lower temperature keeps this factual pass grounded rather than creative.
-    """
+
     resp = requests.post(
         f"{BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -123,12 +118,7 @@ def _map_parsed_to_styles(parsed, styles):
 
 
 def _fallback_caption(style, description):
-    """
-    Guaranteed non-empty caption if the model call/parse fails after all
-    retries. A missing style scores zero per the rules, so a plain templated
-    caption built straight from the factual description beats an empty
-    string every time.
-    """
+
     trimmed = description.strip()
     if len(trimmed) > 280:
         trimmed = trimmed[:277].rsplit(" ", 1)[0] + "..."
@@ -143,11 +133,7 @@ def _fallback_caption(style, description):
 
 
 def get_styled_captions(description, styles, api_key, max_retries=2):
-    """Generate styled captions. Tries up to (max_retries + 1) times total,
-    only retrying if keys are missing after normalization. Bounded so a bad
-    response can't spiral into a long stall. Falls back to a templated,
-    factually-grounded caption rather than an empty string if all retries
-    are exhausted, since a missing style scores zero for that clip."""
+
     style_list = ", ".join(styles)
     definitions_text = "\n".join(f"- {s}: {STYLE_DEFINITIONS[s]}" for s in styles)
     keys_example = ", ".join(f'"{s}": "..."' for s in styles)
