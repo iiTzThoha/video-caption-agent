@@ -63,7 +63,7 @@ docker run --rm \
   video-caption-agent
 ```
 
-No API key needs to be passed at runtime — it's baked into the image at build time (see Requirements below). If you want to test with a different key without rebuilding, you can still override it:
+No API key needs to be passed at runtime, it's baked into the image at build time (see Requirements below). If you want to test with a different key without rebuilding, you can still override it:
 
 ```bash
 docker run --rm \
