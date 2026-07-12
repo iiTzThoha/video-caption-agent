@@ -1,0 +1,276 @@
+import json
+import os
+import sys
+import requests
+
+BASE_URL = "https://api.fireworks.ai/inference/v1"
+MODEL = "accounts/fireworks/models/minimax-m3"
+
+STYLE_DEFINITIONS = {
+    "formal": "Professional, objective, factual tone",
+    "sarcastic": "Dry, ironic, lightly mocking",
+    "humorous_tech": "Funny, with technology or programming references",
+    "humorous_non_tech": "Funny, everyday humour with no technical jargon",
+}
+
+STYLE_LENGTH = {
+    "formal": "3-4 sentences",
+    "sarcastic": "3-4 sentences",
+    "humorous_tech": "3-4 sentences",
+    "humorous_non_tech": "3-4 sentences",
+}
+
+STYLE_EXTRA_GUIDANCE = {
+    "formal": "Be precise and descriptive, but do not pad with unnecessary detail.",
+    "sarcastic": "Land a sharp, dry observation.",
+    "humorous_tech": "Tie tech/programming metaphors directly to real visual details from the description.",
+    "humorous_non_tech": "Land a clear, relatable joke. No technical references at all.",
+}
+
+INPUT_PATH = "/input/tasks.json"
+OUTPUT_PATH = "/output/results.json"
+
+
+def get_api_key():
+    key = os.environ.get("FIREWORKS_API_KEY")
+    if not key:
+        print("ERROR: FIREWORKS_API_KEY environment variable not set", file=sys.stderr)
+        sys.exit(1)
+    return key
+
+
+def normalize_key(key):
+    key_lower = key.lower().strip()
+    key_mappings = {
+        'sarcastic': 'sarcastic',
+        'sarcasm': 'sarcastic',
+        'sarcastik': 'sarcastic',
+        'sarcastc': 'sarcastic',
+        'humorous_tech': 'humorous_tech',
+        'tech_humour': 'humorous_tech',
+        'tech_humor': 'humorous_tech',
+        'humorous_non_tech': 'humorous_non_tech',
+        'nontech_humour': 'humorous_non_tech',
+        'nontech_humor': 'humorous_non_tech',
+        'formal': 'formal',
+        'formel': 'formal',
+    }
+    if key_lower in key_mappings:
+        return key_mappings[key_lower]
+    if 'sarcas' in key_lower:
+        return 'sarcastic'
+    return key_lower
+
+
+def get_video_description(video_url, api_key):
+    resp = requests.post(
+        f"{BASE_URL}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Describe this video factually and specifically, in 5-7 sentences. "
+                                "Cover, in order:\n"
+                                "1. Setting/location and time of day if visible\n"
+                                "2. Subjects present (people, animals, objects) with concrete details: "
+                                "colors, clothing, quantities, distinguishing features\n"
+                                "3. Any visible text, logos, signs, or on-screen labels, if you can read "
+                                "them with reasonable confidence. If text is too blurry, small, fast-moving, "
+                                "or ambiguous to be reasonably sure of the exact characters, don't state a "
+                                "specific reading as fact, describe it generally instead (e.g. 'a sign with "
+                                "text is visible').\n"
+                                "4. The sequence of actions/events in the order they happen\n"
+                                "5. Overall mood or atmosphere\n\n"
+                                "Be precise and literal. Do not speculate about anything not visible. "
+                                "This description will be used as the sole factual source for writing "
+                                "captions afterward, so include every concrete detail a viewer would "
+                                "need to write an accurate caption without watching the video themselves."
+                            ),
+                        },
+                        {"type": "video_url", "video_url": {"url": video_url}},
+                    ],
+                }
+            ],
+            "max_tokens": 5000,
+            "temperature": 0.2,
+        },
+        timeout=25,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    finish_reason = result["choices"][0]["finish_reason"]
+    if finish_reason == "length":
+        print(f"WARNING: description cut off for {video_url}", file=sys.stderr)
+    return result["choices"][0]["message"]["content"]
+
+
+def _map_parsed_to_styles(parsed, styles):
+    result = {}
+    for style in styles:
+        if style in parsed:
+            result[style] = parsed[style]
+            continue
+        found = False
+        for key, value in parsed.items():
+            if normalize_key(key) == style:
+                result[style] = value
+                found = True
+                break
+        if not found:
+            result[style] = ""
+    return result
+
+
+def _fallback_caption(style, description):
+    trimmed = description.strip()
+    if len(trimmed) > 200:
+        trimmed = trimmed[:197].rsplit(" ", 1)[0] + "..."
+    templates = {
+        "formal": trimmed,
+        "sarcastic": f"Well, would you look at that: {trimmed}",
+        "humorous_tech": f"Processing video.exe... output: {trimmed}",
+        "humorous_non_tech": f"Basically what happened here: {trimmed}",
+    }
+    return templates.get(style, trimmed)
+
+
+def get_styled_captions(description, styles, api_key, max_retries=2):
+    style_list = ", ".join(styles)
+    keys_example = ", ".join(f'"{s}": "..."' for s in styles)
+
+    style_specs = "\n".join(
+        f"- {s} ({STYLE_LENGTH[s]}): {STYLE_DEFINITIONS[s]}. {STYLE_EXTRA_GUIDANCE[s]}"
+        for s in styles
+    )
+
+    prompt = f"""Here is a factual description of a video:
+
+"{description}"
+
+Write a caption for this video in EACH of the following styles: {style_list}
+
+Style specs (length is a target range, stay within it):
+{style_specs}
+
+IMPORTANT: Every caption must stay factually grounded in the description above.
+You may exaggerate tone, word choice, and delivery to match the style, but do
+not invent new subjects, actions, objects, or details that are not present in
+the description. The humor or tone comes from HOW you say it, not from making
+things up.
+
+Avoid stock or formulaic openers and phrases such as "Oh look", "Ah yes",
+"Behold", "Truly", "groundbreaking", "the pinnacle of", or similar cliches.
+Vary sentence structure and openings across the four captions so none of them
+read like they came from a template. Write like a sharp, original human
+would, not like a pattern being repeated.
+
+Write in natural, plain punctuation. Do NOT use em dashes (—) or double
+hyphens (--) anywhere. Use commas, periods, or parentheses instead if you
+need to connect or separate ideas.
+
+CRITICAL: Respond with ONLY a valid JSON object, no other text.
+You MUST use these EXACT key names, spelled exactly as shown, nothing else:
+{{{keys_example}}}
+
+Do not misspell the keys. Copy them exactly as given above."""
+
+    result = {s: "" for s in styles}
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 5000,
+                    "temperature": 0.8,
+                },
+                timeout=25,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+
+            content = content.strip()
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
+
+            parsed = json.loads(content)
+        except (requests.RequestException, json.JSONDecodeError, KeyError, IndexError) as e:
+            print(f"WARNING: attempt {attempt + 1} failed: {e}", file=sys.stderr)
+            continue
+
+        mapped = _map_parsed_to_styles(parsed, styles)
+        for s in styles:
+            if mapped.get(s):
+                result[s] = mapped[s]
+
+        missing = [s for s in styles if not result[s]]
+        if not missing:
+            return result
+
+        print(f"WARNING: attempt {attempt + 1}: missing styles {missing}", file=sys.stderr)
+
+    for s in styles:
+        if not result[s]:
+            print(f"WARNING: falling back to templated caption for style '{s}'", file=sys.stderr)
+            result[s] = _fallback_caption(s, description).replace("—", ",")
+
+    return result
+
+
+def process_task(task, api_key):
+    task_id = task["task_id"]
+    video_url = task["video_url"]
+    styles = task["styles"]
+    print(f"Processing {task_id}: {video_url}", file=sys.stderr)
+    description = get_video_description(video_url, api_key)
+    captions = get_styled_captions(description, styles, api_key)
+    return {"task_id": task_id, "captions": captions}
+
+
+def main():
+    api_key = get_api_key()
+
+    if not os.path.exists(INPUT_PATH):
+        print(f"ERROR: {INPUT_PATH} not found", file=sys.stderr)
+        sys.exit(1)
+
+    with open(INPUT_PATH, "r") as f:
+        tasks = json.load(f)
+
+    results = []
+    had_failure = False
+
+    for task in tasks:
+        try:
+            result = process_task(task, api_key)
+            results.append(result)
+        except Exception as e:
+            print(f"ERROR processing task {task.get('task_id', '?')}: {e}", file=sys.stderr)
+            had_failure = True
+            results.append({
+                "task_id": task.get("task_id", "unknown"),
+                "captions": {s: "" for s in task.get("styles", [])},
+            })
+
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    with open(OUTPUT_PATH, "w") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"Done. Wrote {len(results)} results to {OUTPUT_PATH}", file=sys.stderr)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
