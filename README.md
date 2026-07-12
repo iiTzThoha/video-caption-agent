@@ -4,6 +4,16 @@ An AI agent that watches a video clip and generates captions in four styles: **f
 
 Built for the AMD Developer Hackathon: Act II Track 2 (Video Captioning Agent).
 
+## Note on scoring investigation
+
+This repo currently ships `pipeline.py` (matches the live Docker Hub image,
+last scored 0.92). During the event we also tested a variant
+(`pipeline_v2_experimental.py`) with expanded caption length and additional
+prompt constraints, which scored 0.4 on the leaderboard despite testing
+better locally against the public validation clips. We suspect this may be
+related to the leaderboard scoring issue reported in ticket [#1525842127915847710].
+Local test outputs for both versions are available on request.
+
 ## How it works
 
 The pipeline uses a two-stage approach via the [Fireworks AI](https://fireworks.ai) API:
