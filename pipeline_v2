@@ -1,34 +1,71 @@
+#version 2
+
 import json
 import os
+import random
+import re
 import sys
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 
 BASE_URL = "https://api.fireworks.ai/inference/v1"
 MODEL = "accounts/fireworks/models/minimax-m3"
 
+INPUT_PATH = "/input/tasks.json"
+OUTPUT_PATH = "/output/results.json"
+
+REQUEST_TIMEOUT = 25  # seconds per HTTP call; harness allows <30s/request
+MAX_CONTAINER_SECONDS = 9 * 60  # leave ~60s buffer under the 10-minute cap
+MAX_WORKERS = int(os.environ.get("PIPELINE_MAX_WORKERS", "4"))
+DESC_MAX_RETRIES = 2
+CAPTION_MAX_RETRIES = 2
+
 STYLE_DEFINITIONS = {
-    "formal": "Professional, objective, factual tone",
-    "sarcastic": "Dry, ironic, lightly mocking",
-    "humorous_tech": "Funny, with technology or programming references",
-    "humorous_non_tech": "Funny, everyday humour with no technical jargon",
+    "formal": "Professional, objective, factual tone.",
+    "sarcastic": "Dry, ironic, lightly mocking, but still accurate.",
+    "humorous_tech": "Funny, with technology or programming references.",
+    "humorous_non_tech": "Funny, everyday humour with no technical jargon.",
 }
 
+# Tuned to match the organiser's own reference examples, which are almost
+# all one dense sentence (occasionally two or three short beats) rather
+# than the 3-4 / 2-3 sentence targets used in v1/v2.
 STYLE_LENGTH = {
-    "formal": "3-4 sentences",
-    "sarcastic": "3-4 sentences",
-    "humorous_tech": "3-4 sentences",
-    "humorous_non_tech": "3-4 sentences",
+    "formal": "2-3 sentences (one dense, detail-rich sentence is ideal)",
+    "sarcastic": "2-3 sentence ",
+    "humorous_tech": "2-3 sentences",
+    "humorous_non_tech": "2-3 sentence",
 }
 
 STYLE_EXTRA_GUIDANCE = {
-    "formal": "Be precise and descriptive, but do not pad with unnecessary detail.",
-    "sarcastic": "Land a sharp, dry observation.",
-    "humorous_tech": "Tie tech/programming metaphors directly to real visual details from the description.",
-    "humorous_non_tech": "Land a clear, relatable joke. No technical references at all.",
+    "formal": (
+        "Lead with the concrete subject and setting. Be precise, do not pad "
+        "with filler, and do not open with meta phrases like 'this video shows'."
+    ),
+    "sarcastic": (
+        "Land one sharp, dry observation that could only apply to THIS scene. "
+        "Irony comes from tone and framing, not from inventing a twist that "
+        "did not happen."
+    ),
+    "humorous_tech": (
+        "Tie a tech/programming metaphor directly to a real visual detail from "
+        "the description (a colour, an object, an action). The joke should "
+        "stop working if you swap in a different video."
+    ),
+    "humorous_non_tech": (
+        "Land a clear, relatable joke tied to a concrete detail from the "
+        "description. No technical references at all. A relatable "
+        "'when you...' framing is fine but not required, do not force it."
+    ),
 }
 
-INPUT_PATH = "/input/tasks.json"
-OUTPUT_PATH = "/output/results.json"
+_BANNED_OPENER_RE = re.compile(
+    r"^(oh\s+look,?\s*|ah\s+yes,?\s*|behold,?\s*|truly\s+groundbreaking,?\s*)",
+    re.IGNORECASE,
+)
 
 
 def get_api_key():
@@ -62,52 +99,103 @@ def normalize_key(key):
     return key_lower
 
 
-def get_video_description(video_url, api_key):
-    resp = requests.post(
-        f"{BASE_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
+def _clean_caption(text):
+    if not text:
+        return text
+    text = text.replace("—", ",").replace("--", ",")
+    text = re.sub(r"\s+([,.;:])", r"\1", text)  # drop space left before punctuation
+    text = re.sub(r"\s{2,}", " ", text)  # collapse doubled spaces
+    text = _BANNED_OPENER_RE.sub("", text).strip()
+    if text:
+        text = text[0].upper() + text[1:]
+    return text
+
+
+def _extract_json(content):
+    content = content.strip()
+    if content.startswith("```"):
+        parts = content.split("```")
+        if len(parts) >= 2:
+            content = parts[1]
+            if content.lower().startswith("json"):
+                content = content[4:]
+        content = content.strip()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if match:
+        return json.loads(match.group(0))
+    raise json.JSONDecodeError("no JSON object found in model output", content, 0)
+
+
+def _sleep_backoff(attempt):
+    time.sleep(min(1.5 * (attempt + 1), 4) + random.uniform(0, 0.5))
+
+
+def get_video_description(video_url, api_key, deadline, max_retries=DESC_MAX_RETRIES):
+    last_error = None
+    for attempt in range(max_retries + 1):
+        time_left = deadline - time.time()
+        if time_left < 10:
+            raise TimeoutError(f"aborting description call, only {time_left:.0f}s left in budget")
+        timeout = max(5, min(REQUEST_TIMEOUT, time_left - 5))
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": MODEL,
+                    "messages": [
                         {
-                            "type": "text",
-                            "text": (
-                                "Describe this video factually and specifically, in 5-7 sentences. "
-                                "Cover, in order:\n"
-                                "1. Setting/location and time of day if visible\n"
-                                "2. Subjects present (people, animals, objects) with concrete details: "
-                                "colors, clothing, quantities, distinguishing features\n"
-                                "3. Any visible text, logos, signs, or on-screen labels, if you can read "
-                                "them with reasonable confidence. If text is too blurry, small, fast-moving, "
-                                "or ambiguous to be reasonably sure of the exact characters, don't state a "
-                                "specific reading as fact, describe it generally instead (e.g. 'a sign with "
-                                "text is visible').\n"
-                                "4. The sequence of actions/events in the order they happen\n"
-                                "5. Overall mood or atmosphere\n\n"
-                                "Be precise and literal. Do not speculate about anything not visible. "
-                                "This description will be used as the sole factual source for writing "
-                                "captions afterward, so include every concrete detail a viewer would "
-                                "need to write an accurate caption without watching the video themselves."
-                            ),
-                        },
-                        {"type": "video_url", "video_url": {"url": video_url}},
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Describe this video factually and specifically, in 5-7 sentences. "
+                                        "Cover, in order:\n"
+                                        "1. Setting/location and time of day if visible\n"
+                                        "2. Subjects present (people, animals, objects) with concrete details: "
+                                        "colors, clothing, quantities, distinguishing features\n"
+                                        "3. Any visible text, logos, signs, or on-screen labels, if you can read "
+                                        "them with reasonable confidence. If text is too blurry, small, fast-moving, "
+                                        "or ambiguous to be reasonably sure of the exact characters, don't state a "
+                                        "specific reading as fact, describe it generally instead (e.g. 'a sign with "
+                                        "text is visible').\n"
+                                        "4. The sequence of actions/events in the order they happen\n"
+                                        "5. Overall mood or atmosphere\n\n"
+                                        "Be precise and literal. Do not speculate about anything not visible. "
+                                        "This description will be used as the sole factual source for writing "
+                                        "captions afterward, so include every concrete detail a viewer would "
+                                        "need to write an accurate caption without watching the video themselves."
+                                    ),
+                                },
+                                {"type": "video_url", "video_url": {"url": video_url}},
+                            ],
+                        }
                     ],
-                }
-            ],
-            "max_tokens": 5000,
-            "temperature": 0.2,
-        },
-        timeout=25,
-    )
-    resp.raise_for_status()
-    result = resp.json()
-    finish_reason = result["choices"][0]["finish_reason"]
-    if finish_reason == "length":
-        print(f"WARNING: description cut off for {video_url}", file=sys.stderr)
-    return result["choices"][0]["message"]["content"]
+                    "max_tokens": 10000,
+                    "temperature": 0.2,
+                },
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            choice = result["choices"][0]
+            content = choice["message"]["content"]
+            if not content or not content.strip():
+                raise ValueError("empty description content")
+            if choice.get("finish_reason") == "length":
+                print(f"WARNING: description cut off for {video_url}", file=sys.stderr)
+            return content
+        except (requests.RequestException, KeyError, IndexError, ValueError, TypeError) as e:
+            last_error = e
+            print(f"WARNING: description attempt {attempt + 1} failed for {video_url}: {e}", file=sys.stderr)
+            if attempt < max_retries and (deadline - time.time()) > 10:
+                _sleep_backoff(attempt)
+    raise last_error or RuntimeError("description failed with no captured error")
 
 
 def _map_parsed_to_styles(parsed, styles):
@@ -140,12 +228,12 @@ def _fallback_caption(style, description):
     return templates.get(style, trimmed)
 
 
-def get_styled_captions(description, styles, api_key, max_retries=2):
+def get_styled_captions(description, styles, api_key, deadline, max_retries=CAPTION_MAX_RETRIES):
     style_list = ", ".join(styles)
     keys_example = ", ".join(f'"{s}": "..."' for s in styles)
 
     style_specs = "\n".join(
-        f"- {s} ({STYLE_LENGTH[s]}): {STYLE_DEFINITIONS[s]}. {STYLE_EXTRA_GUIDANCE[s]}"
+        f"- {s} ({STYLE_LENGTH[s]}): {STYLE_DEFINITIONS[s]} {STYLE_EXTRA_GUIDANCE[s]}"
         for s in styles
     )
 
@@ -155,34 +243,41 @@ def get_styled_captions(description, styles, api_key, max_retries=2):
 
 Write a caption for this video in EACH of the following styles: {style_list}
 
-Style specs (length is a target range, stay within it):
+Style specs (length is a target, stay close to it, favour punchy over padded):
 {style_specs}
 
-IMPORTANT: Every caption must stay factually grounded in the description above.
-You may exaggerate tone, word choice, and delivery to match the style, but do
-not invent new subjects, actions, objects, or details that are not present in
-the description. The humor or tone comes from HOW you say it, not from making
-things up.
+Grounding rule: every caption, regardless of style, must reference at least
+one concrete, specific detail from the description above (an object, colour,
+action, or setting feature). A caption that could apply to almost any video
+is not acceptable. You may exaggerate tone and word choice to match the
+style, but never invent subjects, actions, objects, or details that are not
+in the description.
 
-Avoid stock or formulaic openers and phrases such as "Oh look", "Ah yes",
-"Behold", "Truly", "groundbreaking", "the pinnacle of", or similar cliches.
-Vary sentence structure and openings across the four captions so none of them
-read like they came from a template. Write like a sharp, original human
-would, not like a pattern being repeated.
+Avoid stock openers and cliches: do not start any caption with "Oh look",
+"Ah yes", "Behold", or similar. Avoid "truly groundbreaking" and "the
+pinnacle of" anywhere. Vary sentence structure and openings across the four
+captions so none of them read like they came from the same template.
 
 Write in natural, plain punctuation. Do NOT use em dashes (—) or double
 hyphens (--) anywhere. Use commas, periods, or parentheses instead if you
 need to connect or separate ideas.
 
-CRITICAL: Respond with ONLY a valid JSON object, no other text.
-You MUST use these EXACT key names, spelled exactly as shown, nothing else:
+CRITICAL: Respond with ONLY a valid JSON object, no other text, no markdown
+fences. You MUST use these EXACT key names, spelled exactly as shown, nothing
+else:
 {{{keys_example}}}
 
 Do not misspell the keys. Copy them exactly as given above."""
 
     result = {s: "" for s in styles}
+    last_error = None
 
     for attempt in range(max_retries + 1):
+        time_left = deadline - time.time()
+        if time_left < 10:
+            print(f"WARNING: caption step aborting early, only {time_left:.0f}s left in budget", file=sys.stderr)
+            break
+        timeout = max(5, min(REQUEST_TIMEOUT, time_left - 5))
         try:
             resp = requests.post(
                 f"{BASE_URL}/chat/completions",
@@ -190,30 +285,28 @@ Do not misspell the keys. Copy them exactly as given above."""
                 json={
                     "model": MODEL,
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 5000,
-                    "temperature": 0.8,
+                    "max_tokens": 10000,
+                    "temperature": 0.7,
                 },
-                timeout=25,
+                timeout=timeout,
             )
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
-
-            content = content.strip()
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.strip()
-
-            parsed = json.loads(content)
-        except (requests.RequestException, json.JSONDecodeError, KeyError, IndexError) as e:
-            print(f"WARNING: attempt {attempt + 1} failed: {e}", file=sys.stderr)
+            parsed = _extract_json(content)
+            if not isinstance(parsed, dict):
+                raise ValueError("model JSON was not an object")
+        except (requests.RequestException, json.JSONDecodeError, KeyError,
+                IndexError, ValueError, TypeError) as e:
+            last_error = e
+            print(f"WARNING: caption attempt {attempt + 1} failed: {e}", file=sys.stderr)
+            if attempt < max_retries and (deadline - time.time()) > 10:
+                _sleep_backoff(attempt)
             continue
 
         mapped = _map_parsed_to_styles(parsed, styles)
         for s in styles:
             if mapped.get(s):
-                result[s] = mapped[s]
+                result[s] = _clean_caption(mapped[s])
 
         missing = [s for s in styles if not result[s]]
         if not missing:
@@ -224,22 +317,31 @@ Do not misspell the keys. Copy them exactly as given above."""
     for s in styles:
         if not result[s]:
             print(f"WARNING: falling back to templated caption for style '{s}'", file=sys.stderr)
-            result[s] = _fallback_caption(s, description).replace("—", ",")
+            result[s] = _clean_caption(_fallback_caption(s, description))
 
     return result
 
 
-def process_task(task, api_key):
-    task_id = task["task_id"]
-    video_url = task["video_url"]
-    styles = task["styles"]
+def process_task(task, api_key, deadline):
+    task_id = task.get("task_id", "unknown")
+    styles = task.get("styles") or list(STYLE_DEFINITIONS.keys())
+    video_url = task.get("video_url")
     print(f"Processing {task_id}: {video_url}", file=sys.stderr)
-    description = get_video_description(video_url, api_key)
-    captions = get_styled_captions(description, styles, api_key)
-    return {"task_id": task_id, "captions": captions}
+    try:
+        if not video_url:
+            raise ValueError("task is missing video_url")
+        description = get_video_description(video_url, api_key, deadline)
+        captions = get_styled_captions(description, styles, api_key, deadline)
+        return {"task_id": task_id, "captions": captions}
+    except Exception as e:
+        print(f"ERROR processing task {task_id}: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return {"task_id": task_id, "captions": {s: "" for s in styles}}
 
 
 def main():
+    start_time = time.time()
+    deadline = start_time + MAX_CONTAINER_SECONDS
     api_key = get_api_key()
 
     if not os.path.exists(INPUT_PATH):
@@ -249,26 +351,37 @@ def main():
     with open(INPUT_PATH, "r") as f:
         tasks = json.load(f)
 
-    results = []
-    had_failure = False
-
-    for task in tasks:
-        try:
-            result = process_task(task, api_key)
-            results.append(result)
-        except Exception as e:
-            print(f"ERROR processing task {task.get('task_id', '?')}: {e}", file=sys.stderr)
-            had_failure = True
-            results.append({
-                "task_id": task.get("task_id", "unknown"),
-                "captions": {s: "" for s in task.get("styles", [])},
-            })
-
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    with open(OUTPUT_PATH, "w") as f:
-        json.dump(results, f, indent=2)
 
-    print(f"Done. Wrote {len(results)} results to {OUTPUT_PATH}", file=sys.stderr)
+    results_by_id = {}
+    order = [t.get("task_id", f"unknown_{i}") for i, t in enumerate(tasks)]
+
+    def flush():
+        ordered = [results_by_id[tid] for tid in order if tid in results_by_id]
+        with open(OUTPUT_PATH, "w") as f:
+            json.dump(ordered, f, indent=2)
+
+    max_workers = max(1, min(MAX_WORKERS, len(tasks) or 1))
+
+    if tasks:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {
+                executor.submit(process_task, task, api_key, deadline): task
+                for task in tasks
+            }
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                task_id = task.get("task_id", "unknown")
+                try:
+                    result = future.result()
+                except Exception as e:
+                    print(f"ERROR: unhandled exception for task {task_id}: {e}", file=sys.stderr)
+                    result = {"task_id": task_id, "captions": {s: "" for s in task.get("styles", [])}}
+                results_by_id[result["task_id"]] = result
+                flush()  # persist progress after every task completes
+
+    elapsed = time.time() - start_time
+    print(f"Done in {elapsed:.1f}s. Wrote {len(results_by_id)} results to {OUTPUT_PATH}", file=sys.stderr)
     sys.exit(0)
 
 
