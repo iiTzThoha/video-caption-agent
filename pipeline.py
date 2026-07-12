@@ -13,6 +13,20 @@ STYLE_DEFINITIONS = {
     "humorous_non_tech": "Funny, everyday humour with no technical jargon",
 }
 
+STYLE_LENGTH = {
+    "formal": "3-4 sentences",
+    "sarcastic": "3-4 sentences",
+    "humorous_tech": "3-4 sentences",
+    "humorous_non_tech": "3-4 sentences",
+}
+
+STYLE_EXTRA_GUIDANCE = {
+    "formal": "Be precise and descriptive, but do not pad with unnecessary detail.",
+    "sarcastic": "Land a sharp, dry observation.",
+    "humorous_tech": "Tie tech/programming metaphors directly to real visual details from the description.",
+    "humorous_non_tech": "Land a clear, relatable joke. No technical references at all.",
+}
+
 INPUT_PATH = "/input/tasks.json"
 OUTPUT_PATH = "/output/results.json"
 
@@ -26,9 +40,7 @@ def get_api_key():
 
 
 def normalize_key(key):
-    """Convert various spellings to our standard keys"""
     key_lower = key.lower().strip()
-
     key_mappings = {
         'sarcastic': 'sarcastic',
         'sarcasm': 'sarcastic',
@@ -43,18 +55,14 @@ def normalize_key(key):
         'formal': 'formal',
         'formel': 'formal',
     }
-
     if key_lower in key_mappings:
         return key_mappings[key_lower]
-
     if 'sarcas' in key_lower:
         return 'sarcastic'
-
     return key_lower
 
 
 def get_video_description(video_url, api_key):
-
     resp = requests.post(
         f"{BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -72,8 +80,11 @@ def get_video_description(video_url, api_key):
                                 "1. Setting/location and time of day if visible\n"
                                 "2. Subjects present (people, animals, objects) with concrete details: "
                                 "colors, clothing, quantities, distinguishing features\n"
-                                "3. Any visible text, logos, signs, or on-screen labels, quoted exactly "
-                                "if legible\n"
+                                "3. Any visible text, logos, signs, or on-screen labels, if you can read "
+                                "them with reasonable confidence. If text is too blurry, small, fast-moving, "
+                                "or ambiguous to be reasonably sure of the exact characters, don't state a "
+                                "specific reading as fact, describe it generally instead (e.g. 'a sign with "
+                                "text is visible').\n"
                                 "4. The sequence of actions/events in the order they happen\n"
                                 "5. Overall mood or atmosphere\n\n"
                                 "Be precise and literal. Do not speculate about anything not visible. "
@@ -100,7 +111,6 @@ def get_video_description(video_url, api_key):
 
 
 def _map_parsed_to_styles(parsed, styles):
-    """Match parsed JSON keys to requested styles, using normalization as a fallback."""
     result = {}
     for style in styles:
         if style in parsed:
@@ -118,11 +128,9 @@ def _map_parsed_to_styles(parsed, styles):
 
 
 def _fallback_caption(style, description):
-
     trimmed = description.strip()
-    if len(trimmed) > 280:
-        trimmed = trimmed[:277].rsplit(" ", 1)[0] + "..."
-
+    if len(trimmed) > 200:
+        trimmed = trimmed[:197].rsplit(" ", 1)[0] + "..."
     templates = {
         "formal": trimmed,
         "sarcastic": f"Well, would you look at that: {trimmed}",
@@ -133,10 +141,13 @@ def _fallback_caption(style, description):
 
 
 def get_styled_captions(description, styles, api_key, max_retries=2):
-
     style_list = ", ".join(styles)
-    definitions_text = "\n".join(f"- {s}: {STYLE_DEFINITIONS[s]}" for s in styles)
     keys_example = ", ".join(f'"{s}": "..."' for s in styles)
+
+    style_specs = "\n".join(
+        f"- {s} ({STYLE_LENGTH[s]}): {STYLE_DEFINITIONS[s]}. {STYLE_EXTRA_GUIDANCE[s]}"
+        for s in styles
+    )
 
     prompt = f"""Here is a factual description of a video:
 
@@ -144,14 +155,24 @@ def get_styled_captions(description, styles, api_key, max_retries=2):
 
 Write a caption for this video in EACH of the following styles: {style_list}
 
-Style definitions:
-{definitions_text}
+Style specs (length is a target range, stay within it):
+{style_specs}
 
 IMPORTANT: Every caption must stay factually grounded in the description above.
 You may exaggerate tone, word choice, and delivery to match the style, but do
 not invent new subjects, actions, objects, or details that are not present in
 the description. The humor or tone comes from HOW you say it, not from making
 things up.
+
+Avoid stock or formulaic openers and phrases such as "Oh look", "Ah yes",
+"Behold", "Truly", "groundbreaking", "the pinnacle of", or similar cliches.
+Vary sentence structure and openings across the four captions so none of them
+read like they came from a template. Write like a sharp, original human
+would, not like a pattern being repeated.
+
+Write in natural, plain punctuation. Do NOT use em dashes (—) or double
+hyphens (--) anywhere. Use commas, periods, or parentheses instead if you
+need to connect or separate ideas.
 
 CRITICAL: Respond with ONLY a valid JSON object, no other text.
 You MUST use these EXACT key names, spelled exactly as shown, nothing else:
@@ -170,7 +191,7 @@ Do not misspell the keys. Copy them exactly as given above."""
                     "model": MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 5000,
-                    "temperature": 0.7,
+                    "temperature": 0.8,
                 },
                 timeout=25,
             )
@@ -196,16 +217,14 @@ Do not misspell the keys. Copy them exactly as given above."""
 
         missing = [s for s in styles if not result[s]]
         if not missing:
-            return result  # all styles present, done
+            return result
 
         print(f"WARNING: attempt {attempt + 1}: missing styles {missing}", file=sys.stderr)
-        # loop again only if we have retries left; otherwise fall through and
-        # fill any still-missing styles with a templated fallback below
 
     for s in styles:
         if not result[s]:
             print(f"WARNING: falling back to templated caption for style '{s}'", file=sys.stderr)
-            result[s] = _fallback_caption(s, description)
+            result[s] = _fallback_caption(s, description).replace("—", ",")
 
     return result
 
@@ -214,12 +233,9 @@ def process_task(task, api_key):
     task_id = task["task_id"]
     video_url = task["video_url"]
     styles = task["styles"]
-
     print(f"Processing {task_id}: {video_url}", file=sys.stderr)
-
     description = get_video_description(video_url, api_key)
     captions = get_styled_captions(description, styles, api_key)
-
     return {"task_id": task_id, "captions": captions}
 
 
